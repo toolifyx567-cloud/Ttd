@@ -1,420 +1,286 @@
-import threading
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import yt_dlp
 import time
-import requests
+import threading
+import sqlite3
+import os
+import re
 import random
 import string
-import re
-import sqlite3
-import concurrent.futures
+import requests
+from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
-import os
 
+# ===== LOAD ENV VARIABLES =====
 load_dotenv()
-
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+if not ADMIN_PASSWORD:
+    raise ValueError("ADMIN_PASSWORD not set in environment variables")
 
 app = Flask(__name__)
 CORS(app)
 
-# ===== SESSION SETUP (OPTIMIZED) =====
-session = requests.Session()
+DB_FILE = "toolifyx_stats.db"
 
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# ===============================
+# DATABASE INIT
+# ===============================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
 
-session.headers.update({"User-Agent": "Mozilla/5.0"})
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            requests INTEGER DEFAULT 0,
+            downloads INTEGER DEFAULT 0,
+            cache_hits INTEGER DEFAULT 0,
+            videos_served INTEGER DEFAULT 0
+        )
+    """)
 
-retry = Retry(
-    total=3,
-    backoff_factor=0.2,
-    status_forcelist=[429, 500, 502, 503, 504]
-)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS unique_ips (
+            ip TEXT PRIMARY KEY
+        )
+    """)
 
-adapter = HTTPAdapter(
-    max_retries=retry,
-    pool_connections=1000,
-    pool_maxsize=1000
-)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS download_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT,
+            url TEXT,
+            timestamp INTEGER
+        )
+    """)
 
-session.mount("http://", adapter)
-session.mount("https://", adapter)
+    c.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
+    conn.commit()
+    conn.close()
 
-# ===== SQLITE DATABASE =====
-conn = sqlite3.connect("stats.db", check_same_thread=False)
-c = conn.cursor()
+init_db()
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS stats (
-    key TEXT PRIMARY KEY,
-    value INTEGER
-)
-''')
+stats = {
+    "requests": 0,
+    "downloads": 0,
+    "cache_hits": 0,
+    "videos_served": 0,
+    "unique_ips": set(),
+    "download_logs": []
+}
 
-for key in ["requests", "downloads", "cache_hits", "videos_served"]:
-    c.execute("INSERT OR IGNORE INTO stats (key,value) VALUES (?,?)", (key,0))
-
-conn.commit()
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS unique_ips (
-    ip TEXT PRIMARY KEY
-)
-''')
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS video_cache (
-    url TEXT PRIMARY KEY,
-    video_url TEXT
-)
-''')
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS download_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT,
-    url TEXT,
-    timestamp INTEGER
-)
-''')
-
-conn.commit()
-
-# ===== RAM CACHE =====
 cache = {}
 
-# ===== HELPERS =====
-def clean_filename(text):
-    text = re.sub(r'[\\/*?:"<>|]', "", text)
-    text = re.sub(r'\s+', " ", text).strip()
-    return text[:120]
-
+# ===============================
+# HELPERS
+# ===============================
 def random_string(length=6):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-# ===== EXPAND SHORT TIKTOK LINKS =====
-def expand_url(url):
+def clean_filename(name):
+    name = re.sub(r'[^a-zA-Z0-9 ]', '', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = name[:40]
+    return f"{name} ToolifyX_{random_string()}.mp4"
+
+def increment_stat(field):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(f"UPDATE stats SET {field} = {field} + 1 WHERE id = 1")
+    conn.commit()
+    conn.close()
+
+def add_unique_ip(ip):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)", (ip,))
+    conn.commit()
+    conn.close()
+
+def add_download_log(ip, url):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO download_logs (ip, url, timestamp) VALUES (?, ?, ?)",
+        (ip, url, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+
+# ===============================
+# CLEAN & RESOLVE URL
+# ===============================
+def resolve_redirect(url):
     try:
-        if "vt.tiktok.com" in url or "vm.tiktok.com" in url:
-            r = session.head(url, allow_redirects=True, timeout=5)
+        if "vt.tiktok.com" in url:
+            r = requests.head(url, allow_redirects=True, timeout=10)
             return r.url
     except:
         pass
     return url
 
-# ===== API FETCHERS =====
-def fetch_tikwm(url):
+def clean_url(url):
+    parsed = urlparse(url)
+    clean = parsed._replace(query="")
+    return urlunparse(clean)
+
+# ===============================
+# VIDEO EXTRACTION
+# ===============================
+def extract_video(url, result_holder):
     try:
-        res = session.post(
-            "https://www.tikwm.com/api/",
-            data={"url": url, "hd": "1"},
-            timeout=5
-        )
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            video = data.get("play")
-            if video:
-                return {
-                    "video_url": video,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", {}).get("nickname", "") or data.get("author", {}).get("unique_id", ""),
-                    "thumbnail": data.get("cover", "")
-                }
-    except:
-        pass
-    return None
+        ydl_opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "retries": 3,
+            "socket_timeout": 20,
+            "format": "bestvideo+bestaudio/best",
+            "nocheckcertificate": True,
+        }
 
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-def fetch_tikwm_alt(url):
-    try:
-        res = session.post(
-            "https://tikwm.com/api/",
-            data={"url": url},
-            timeout=5
-        )
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            video = data.get("play")
-            if video:
-                return {
-                    "video_url": video,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", {}).get("nickname", "") or data.get("author", {}).get("unique_id", ""),
-                    "thumbnail": data.get("cover", "")
-                }
-    except:
-        pass
-    return None
+            if "entries" in info:
+                info = info["entries"][0]
 
+            formats = info.get("formats", [])
 
-def fetch_backup(url):
-    try:
-        res = session.post(
-            "https://api2.musicaldown.com/v2/download",
-            data={"url": url},
-            timeout=6
-        )
-        if res.status_code == 200:
-            data = res.json()
-            video_url = data.get("video", {}).get("no_watermark")
-            if video_url:
-                return {
-                    "video_url": video_url,
-                    "title": data.get("title", ""),
-                    "author": data.get("author", ""),
-                    "thumbnail": data.get("thumbnail", "")
-                }
-    except:
-        pass
-    return None
+            # pick best mp4 video format
+            best_format = None
+            for f in formats:
+                if f.get("ext") == "mp4" and f.get("vcodec") != "none":
+                    best_format = f
 
-# ===== PARALLEL FETCH (ULTRA FAST) =====
-def fetch_tiktok_video(url):
+            if best_format:
+                result_holder["url"] = best_format.get("url")
+            else:
+                result_holder["url"] = info.get("url")
 
-    url = expand_url(url)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-
-        futures = [
-            executor.submit(fetch_tikwm, url),
-            executor.submit(fetch_tikwm_alt, url),
-            executor.submit(fetch_backup, url)
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                result["original_url"] = url
-                return result
-
-    return None
-
-# ===== SAVE CACHE =====
-def save_cache_db(url, video_url):
-    try:
-        conn2 = sqlite3.connect("stats.db")
-        c2 = conn2.cursor()
-
-        c2.execute(
-            "INSERT OR REPLACE INTO video_cache (url,video_url) VALUES (?,?)",
-            (url,video_url)
-        )
-
-        conn2.commit()
-        conn2.close()
+            result_holder["title"] = info.get("title", "Video")
 
     except Exception as e:
-        print("DB thread error:", e)
+        result_holder["error"] = str(e)
 
-# ===== DOWNLOAD ROUTE =====
+def fetch_video_smart(url):
+    if url in cache:
+        stats["cache_hits"] += 1
+        increment_stat("cache_hits")
+        return cache[url]
+
+    result = {}
+    t = threading.Thread(target=extract_video, args=(url, result))
+    t.start()
+    t.join(timeout=30)
+
+    if t.is_alive():
+        return None
+
+    video_url = result.get("url")
+    title = result.get("title", "Video")
+
+    if video_url:
+        cache[url] = (video_url, title)
+
+    return cache.get(url)
+
+# ===============================
+# DOWNLOAD ROUTE
+# ===============================
 @app.route("/download", methods=["POST"])
 def download_video():
 
-    try:
-        data = request.get_json()
-        url = data.get("url")
-        ip = request.remote_addr
+    stats["requests"] += 1
+    increment_stat("requests")
 
-        if not url:
-            return jsonify({"success": False, "message": "No URL"}),400
+    ip = request.remote_addr
+    stats["unique_ips"].add(ip)
+    add_unique_ip(ip)
 
-        # Stats update
-        try:
-            c.execute("UPDATE stats SET value=value+1 WHERE key='requests'")
-            c.execute("INSERT OR IGNORE INTO unique_ips (ip) VALUES (?)",(ip,))
-            conn.commit()
-        except:
-            pass
+    data = request.get_json()
+    url = data.get("url")
 
-        # Fetch fresh data every time (no cache to avoid expired URLs)
-        result = fetch_tiktok_video(url)
+    if not url:
+        return jsonify({"success": False, "error": "No URL provided"}), 400
 
-        print("FETCH RESULT:",result)
+    # Resolve short links
+    url = resolve_redirect(url)
 
-        if not result:
-            return jsonify({"success":False,"message":"Fetch failed"}),500
+    # Clean tracking parameters
+    url = clean_url(url)
 
-        video_url = result["video_url"]
-        title = result.get("title", "")
-        author = result.get("author", "")
-        thumbnail = result.get("thumbnail", "")
-        original_url = result.get("original_url", url)
+    # Supported platforms
+    if not any(domain in url for domain in [
+        "tiktok.com",
+        "instagram.com",
+        "facebook.com",
+        "fb.watch",
+        "twitter.com",
+        "x.com"
+    ]):
+        return jsonify({"success": False, "error": "Unsupported URL"}), 400
 
-        # Save to cache (for reference, but we re-fetch on /file)
-        cache[url] = video_url
-        threading.Thread(
-            target=save_cache_db,
-            args=(url,video_url),
-            daemon=True
-        ).start()
+    result = fetch_video_smart(url)
 
-        # Stats
-        try:
-            c.execute("UPDATE stats SET value=value+1 WHERE key='downloads'")
-            c.execute("UPDATE stats SET value=value+1 WHERE key='videos_served'")
-            c.execute(
-                "INSERT INTO download_logs (ip,url,timestamp) VALUES (?,?,?)",
-                (ip,url,int(time.time()))
-            )
-            conn.commit()
-        except:
-            pass
+    if not result:
+        return jsonify({"success": False, "error": "Video extraction failed"}), 408
 
-        filename = clean_filename(title or "ToolifyX Downloader")+"_"+random_string()+".mp4"
+    video_url, title = result
 
-        return jsonify({
-            "success":True,
-            "url":video_url,
-            "filename":filename,
-            "title":title,
-            "author":author,
-            "thumbnail":thumbnail,
-            "videoId": url
-        })
+    stats["downloads"] += 1
+    stats["videos_served"] += 1
+    increment_stat("downloads")
+    increment_stat("videos_served")
 
-    except Exception as e:
-        print("CRASH PREVENTED:",e)
+    add_download_log(ip, url)
 
-        return jsonify({
-            "success":False,
-            "message":"Server recovered automatically"
-        }),500
+    return jsonify({
+        "success": True,
+        "url": video_url,
+        "filename": clean_filename(title)
+    })
 
-# ===== FILE SERVING (RE-FETCH FRESH URL) =====
-@app.route("/file")
-def serve_file():
-
-    # Support both old "url" param and new "videoId" param
-    video_url = request.args.get("url")
-    video_id = request.args.get("videoId")
-    mode = request.args.get("mode","preview")
-
-    # If videoId provided, re-fetch fresh URL
-    if video_id and not video_url:
-        result = fetch_tiktok_video(video_id)
-        if result:
-            video_url = result["video_url"]
-        else:
-            return jsonify({"success":False,"message":"Could not re-fetch video. Link may be expired or invalid."}),500
-
-    if not video_url:
-        return jsonify({"success":False,"message":"No video URL"}),400
-
-    try:
-        # Parse Range header from client (e.g., "bytes=0-1023" or "bytes=1024-")
-        range_header = request.headers.get("Range")
-
-        # Build request headers to forward to source
-        source_headers = {}
-        if range_header:
-            source_headers["Range"] = range_header
-
-        # Request from source with range support
-        r = session.get(video_url, stream=True, timeout=15, headers=source_headers)
-
-        rand = random_string()
-        filename = f"ToolifyX Downloader-{rand}.mp4"
-
-        # Determine response status
-        status_code = 206 if r.status_code == 206 else 200
-
-        # Build response headers
-        headers = {
-            "Content-Type": r.headers.get("Content-Type", "video/mp4"),
-            "Accept-Ranges": "bytes",  # Tell client we support resume
-        }
-
-        # Forward Content-Range if source sent it (partial content)
-        if "Content-Range" in r.headers:
-            headers["Content-Range"] = r.headers["Content-Range"]
-
-        # Forward Content-Length (either full or partial)
-        if "Content-Length" in r.headers:
-            headers["Content-Length"] = r.headers["Content-Length"]
-
-        # Content-Disposition
-        disposition = (
-            f'attachment; filename="{filename}"'
-            if mode=="download"
-            else f'inline; filename="{filename}"'
-        )
-        headers["Content-Disposition"] = disposition
-
-        # Stream generator
-        def generate():
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    yield chunk
-
-        return Response(
-            generate(),
-            status=status_code,
-            headers=headers
-        )
-
-    except Exception as e:
-        return jsonify({"success":False,"message":str(e)}),500
-
-# ===== STATS =====
-@app.route("/stats",methods=["GET"])
+# ===============================
+# STATS ROUTE
+# ===============================
+@app.route("/stats", methods=["GET"])
 def get_stats():
-
-    c.execute("SELECT key,value FROM stats")
-    stats_data=dict(c.fetchall())
-
-    c.execute("SELECT COUNT(*) FROM unique_ips")
-    unique_ips_count=c.fetchone()[0]
-
-    c.execute("SELECT ip,url,timestamp FROM download_logs")
-
-    logs=[
-        {"ip":ip,"url":url,"timestamp":ts}
-        for ip,url,ts in c.fetchall()
-    ]
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT requests, downloads, cache_hits, videos_served FROM stats WHERE id=1")
+    stats_row = c.fetchone()
+    conn.close()
 
     return jsonify({
-        **stats_data,
-        "unique_ips":unique_ips_count,
-        "download_logs":logs
+        "requests": stats_row[0],
+        "downloads": stats_row[1],
+        "cache_hits": stats_row[2],
+        "videos_served": stats_row[3],
+        "unique_ips": len(stats["unique_ips"])
     })
 
-# ===== WAKE =====
-@app.route("/wake",methods=["GET"])
-def wake():
-    return jsonify({
-        "success":True,
-        "message":"Server is awake"
-    })
-
-# ===== ADMIN RESET =====
-ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD")
-
-@app.route("/admin/reset",methods=["POST"])
+# ===============================
+# ADMIN RESET
+# ===============================
+@app.route("/admin/reset", methods=["POST"])
 def reset_stats():
+    data = request.get_json()
+    if data.get("password") != ADMIN_PASSWORD:
+        return jsonify({"success": False}), 401
 
-    data=request.get_json()
-    password=data.get("password")
+    cache.clear()
 
-    if password!=ADMIN_PASSWORD:
-        return jsonify({
-            "success":False,
-            "message":"Wrong password"
-        }),401
-
-    for key in ["requests","downloads","cache_hits","videos_served"]:
-        c.execute("UPDATE stats SET value=0 WHERE key=?",(key,))
-
-    c.execute("DELETE FROM unique_ips")
-    c.execute("DELETE FROM download_logs")
-
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE stats SET requests=0, downloads=0, cache_hits=0, videos_served=0 WHERE id=1")
     conn.commit()
+    conn.close()
 
-    return jsonify({"success":True})
+    return jsonify({"success": True})
 
-# ===== START SERVER =====
-if __name__=="__main__":
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        threaded=True
-    )
+# ===============================
+# RUN SERVER
+# ===============================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
